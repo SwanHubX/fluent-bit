@@ -18,6 +18,8 @@ on:
   pull_request:
     # Limit to just those changes that 'might' affect Windows for automated builds
     # We can always do a manual build for a branch
+    # The dev branch publishes only Linux amd64; retain manual Windows runs.
+    branches-ignore: [v5.1.2-dev]
     paths:
       - '**.h'
       - '**.c'
