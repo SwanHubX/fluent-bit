@@ -3,6 +3,8 @@
 name: Run unit tests
 on:
   pull_request:
+    # This placeholder is for upstream required checks, not the dev branch.
+    branches-ignore: [v5.1.2-dev]
     paths:
       - '.github/**'
       - 'dockerfiles/**'

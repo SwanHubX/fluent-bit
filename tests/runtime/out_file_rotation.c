@@ -63,6 +63,11 @@ void flb_test_file_rotation_fallback_destination(void);
 void flb_test_file_rotation_metrics(void);
 void flb_test_file_rotation_repeated_flush_all_formats(void);
 void flb_test_file_rotation_open_failure_releases_lock(void);
+#ifndef FLB_SYSTEM_WINDOWS
+void flb_test_file_atomic_tail(void);
+void flb_test_file_atomic_retry(void);
+void flb_test_file_atomic_config(void);
+#endif
 
 /* Test list */
 TEST_LIST = {
@@ -94,6 +99,11 @@ TEST_LIST = {
      flb_test_file_rotation_repeated_flush_all_formats},
     {"open_failure_releases_lock",
      flb_test_file_rotation_open_failure_releases_lock},
+#ifndef FLB_SYSTEM_WINDOWS
+    {"atomic_tail", flb_test_file_atomic_tail},
+    {"atomic_retry", flb_test_file_atomic_retry},
+    {"atomic_config", flb_test_file_atomic_config},
+#endif
     {NULL, NULL}};
 
 #define TEST_LOGFILE "flb_test_file_rotation.log"
@@ -2495,3 +2505,122 @@ void flb_test_file_rotation_open_failure_releases_lock(void)
 
     recursive_delete_directory(TEST_LOGPATH);
 }
+
+#ifndef FLB_SYSTEM_WINDOWS
+/* A single flush must publish a complete NDJSON file without another event. */
+void flb_test_file_atomic_tail(void)
+{
+    const char *tag = "namespace.project.run.scalar.v1";
+    char published[PATH_MAX];
+    char active[PATH_MAX];
+    char *content;
+    struct stat st;
+    size_t size;
+    flb_ctx_t *ctx;
+    int in_ffd;
+    int out_ffd;
+    int bytes;
+
+    recursive_delete_directory(TEST_LOGPATH);
+    TEST_MKDIR(TEST_LOGPATH);
+    ctx = flb_create();
+    TEST_ASSERT(flb_service_set(ctx, "Flush", TEST_FLUSH_INTERVAL, "Grace", "1",
+                                "Log_Level", "error", NULL) == 0);
+    in_ffd = flb_input(ctx, (char *) "lib", NULL);
+    TEST_CHECK(in_ffd >= 0);
+    TEST_ASSERT(flb_input_set(ctx, in_ffd, "tag", tag, NULL) == 0);
+    out_ffd = flb_output(ctx, (char *) "file", NULL);
+    TEST_CHECK(out_ffd >= 0);
+    TEST_ASSERT(flb_output_set(ctx, out_ffd, "match", tag, "path", TEST_LOGPATH,
+                               "format", "plain", "atomic_chunks", "true",
+                               "rotate", "true", "rotate_max_size", "1",
+                               "rotate_max_files", "1", NULL) == 0);
+    TEST_CHECK(flb_start(ctx) == 0);
+
+    bytes = flb_lib_push(ctx, in_ffd, (char *) JSON_SMALL, strlen(JSON_SMALL));
+    TEST_CHECK(bytes == strlen(JSON_SMALL));
+    TEST_CHECK(wait_for_file_pattern(TEST_LOGPATH, "namespace.project.run.scalar.v1.",
+                                     ".ready", TEST_TIMEOUT_MS) == 1);
+    TEST_CHECK(wait_for_output_records(ctx, 1) == 0);
+    snprintf(active, sizeof(active), "%s/%s", TEST_LOGPATH, tag);
+    TEST_CHECK(access(active, F_OK) != 0);
+    TEST_CHECK(find_file_pattern(TEST_LOGPATH, "namespace.project.run.scalar.v1.",
+                                 ".ready", published, sizeof(published)) == 1);
+    TEST_CHECK(stat(published, &st) == 0);
+    TEST_CHECK((st.st_mode & 0444) == 0444);
+    content = read_file_content(published, &size);
+    TEST_CHECK(content != NULL);
+    if (content != NULL) {
+        TEST_CHECK(size > 0 && content[size - 1] == '\n');
+        TEST_CHECK(strstr(content, "\"key_0\"") != NULL);
+        flb_free(content);
+    }
+
+    bytes = flb_lib_push(ctx, in_ffd, (char *) JSON_SMALL, strlen(JSON_SMALL));
+    TEST_CHECK(bytes == strlen(JSON_SMALL));
+    TEST_CHECK(wait_for_output_records(ctx, 2) == 0);
+    TEST_CHECK(count_files_in_directory(TEST_LOGPATH,
+                                         "namespace.project.run.scalar.v1.") == 2);
+    flb_stop(ctx);
+    flb_destroy(ctx);
+    recursive_delete_directory(TEST_LOGPATH);
+}
+
+/* A failed flush retains the chunk; creating the directory lets the retry publish it. */
+void flb_test_file_atomic_retry(void)
+{
+    const char *tag = "namespace.project.run.scalar.v1";
+    flb_ctx_t *ctx;
+    int in_ffd;
+    int out_ffd;
+    int bytes;
+
+    recursive_delete_directory(TEST_LOGPATH);
+    ctx = flb_create();
+    TEST_ASSERT(flb_service_set(ctx, "Flush", TEST_FLUSH_INTERVAL, "Grace", "1",
+                                "Log_Level", "error", NULL) == 0);
+    in_ffd = flb_input(ctx, (char *) "lib", NULL);
+    TEST_CHECK(in_ffd >= 0);
+    TEST_ASSERT(flb_input_set(ctx, in_ffd, "tag", tag, NULL) == 0);
+    out_ffd = flb_output(ctx, (char *) "file", NULL);
+    TEST_CHECK(out_ffd >= 0);
+    TEST_ASSERT(flb_output_set(ctx, out_ffd, "match", tag, "path", TEST_LOGPATH,
+                               "format", "plain", "atomic_chunks", "true",
+                               "mkdir", "false", "Retry_Limit", "False", NULL) == 0);
+    TEST_CHECK(flb_start(ctx) == 0);
+    bytes = flb_lib_push(ctx, in_ffd, (char *) JSON_SMALL, strlen(JSON_SMALL));
+    TEST_CHECK(bytes == strlen(JSON_SMALL));
+    flb_time_msleep(500);
+    TEST_CHECK(count_files_in_directory(TEST_LOGPATH, "") == -1);
+    TEST_MKDIR(TEST_LOGPATH);
+    TEST_CHECK(wait_for_file_pattern(TEST_LOGPATH, "namespace.project.run.scalar.v1.",
+                                     ".ready", TEST_TIMEOUT_MS * 3) == 1);
+    TEST_CHECK(wait_for_output_records(ctx, 1) == 0);
+    TEST_CHECK(count_files_in_directory(TEST_LOGPATH,
+                                         "namespace.project.run.scalar.v1.") == 1);
+    flb_stop(ctx);
+    flb_destroy(ctx);
+    recursive_delete_directory(TEST_LOGPATH);
+}
+
+/* The new mode must reject combinations whose output cannot be a route NDJSON file. */
+void flb_test_file_atomic_config(void)
+{
+    flb_ctx_t *ctx;
+    int in_ffd;
+    int out_ffd;
+
+    ctx = flb_create();
+    TEST_ASSERT(flb_service_set(ctx, "Flush", TEST_FLUSH_INTERVAL, "Log_Level",
+                                "error", NULL) == 0);
+    in_ffd = flb_input(ctx, (char *) "lib", NULL);
+    TEST_CHECK(in_ffd >= 0);
+    TEST_ASSERT(flb_input_set(ctx, in_ffd, "tag", "test", NULL) == 0);
+    out_ffd = flb_output(ctx, (char *) "file", NULL);
+    TEST_CHECK(out_ffd >= 0);
+    TEST_ASSERT(flb_output_set(ctx, out_ffd, "match", "test", "path", TEST_LOGPATH,
+                               "format", "csv", "atomic_chunks", "true", NULL) == 0);
+    TEST_CHECK(flb_start(ctx) != 0);
+    flb_destroy(ctx);
+}
+#endif

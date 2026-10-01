@@ -1,6 +1,8 @@
 name: 'Pull requests labels'
 on:
   pull_request_target:
+    # The upstream docs-required label is not part of the dev branch process.
+    branches-ignore: [v5.1.2-dev]
     types:
       - opened
 
@@ -19,4 +21,4 @@ jobs:
           labels: docs-required
           github_token: ${{ secrets.GITHUB_TOKEN }}
           number: ${{ github.event.pull_request.number }}
-          repo: fluent/fluent-bit
+          repo: ${{ github.repository }}

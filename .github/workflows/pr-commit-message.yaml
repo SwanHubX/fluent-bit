@@ -1,6 +1,8 @@
 name: 'Pull requests commit messages'
 on:
   pull_request:
+    # Commit Prefix Lint already checks every commit in dev branch PRs.
+    branches-ignore: [v5.1.2-dev]
     types:
       - opened
       - edited

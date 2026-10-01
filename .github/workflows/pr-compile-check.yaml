@@ -2,6 +2,7 @@ name: 'Pull requests compile checks'
 on:
   pull_request:
     # Only trigger if there is a code change or a CMake change that (could) affect code
+    branches-ignore: [v5.1.2-dev]
     paths:
       - '**.c'
       - '**.h'

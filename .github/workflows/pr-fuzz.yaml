@@ -2,6 +2,7 @@ name: CIFuzz
 on:
   pull_request:
     # Only fuzz when C source files change
+    branches-ignore: [v5.1.2-dev]
     paths:
       - '**.c'
       - '**.h'
