@@ -1,0 +1,42 @@
+name: Dev branch tests
+
+on:
+  pull_request:
+    branches: [v5.1.2-dev]
+    types: [opened, synchronize, reopened]
+  # The image workflow reuses this job so direct pushes are tested before publishing.
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Internal and runtime tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential bison flex libcurl4-openssl-dev libpq-dev \
+            libsasl2-dev libssl-dev libsystemd-dev libyaml-dev pkg-config zlib1g-dev
+      - name: Set up CMake
+        uses: jwlawson/actions-setup-cmake@0d6a7d60b009d01c9e7523be22153ff8f19460d3 # v2.2.0
+        with:
+          cmake-version: '3.31.6'
+      - name: Configure tests
+        run: >-
+          cmake -S . -B build
+          -DFLB_CONFIG_YAML=On
+          -DFLB_TESTS_INTERNAL=On
+          -DFLB_TESTS_RUNTIME=On
+      - name: Build
+        run: cmake --build build --parallel 4
+      # Run every test enabled by the internal/runtime CMake configuration.
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure --timeout 300
