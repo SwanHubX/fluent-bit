@@ -1,0 +1,76 @@
+name: Build and publish dev image
+
+on:
+  push:
+    branches: [v5.1.2-dev]
+
+concurrency:
+  group: fluent-bit-dev-image-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: registry.for-helper.pytrio.cn
+  IMAGE_NAME: registry.for-helper.pytrio.cn/trio/fluent-bit
+
+jobs:
+  # A merge and a direct push both enter here; neither can publish without passing CI.
+  test:
+    uses: ./.github/workflows/ci-dev.yaml
+
+  publish:
+    name: Publish Linux amd64 image
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=docker.io/moby/buildkit:buildx-stable-1
+      - name: Log in to container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: weather
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+      - name: Set image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            # Moving branch tag for deployment; commit tag for rollback.
+            type=raw,value=v5.1.2-dev
+            type=sha,format=short
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: dockerfiles/Dockerfile
+          target: production
+          platforms: linux/amd64
+          build-args: |
+            RELEASE_VERSION=5.1.2-dev
+          # Match upstream's legacy-compatible production image format.
+          provenance: false
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=fluent-bit-dev
+          cache-to: type=gha,mode=max,scope=fluent-bit-dev
+      - name: Verify built plugin
+        run: |
+          image="${IMAGE_NAME}:sha-${GITHUB_SHA:0:7}"
+          docker run --rm "$image" -o file -h | grep -F atomic_chunks
+      # Publish the moving tag only after the commit tag has been uploaded.
+      - name: Push image
+        run: |
+          docker push "${IMAGE_NAME}:sha-${GITHUB_SHA:0:7}"
+          docker push "${IMAGE_NAME}:v5.1.2-dev"
