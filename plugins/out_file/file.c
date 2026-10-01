@@ -26,6 +26,9 @@
 #include <fluent-bit/flb_hash_table.h>
 #include <fluent-bit/flb_log_event_decoder.h>
 #include <fluent-bit/flb_record_accessor.h>
+#include <fluent-bit/flb_hash.h>
+#include <fluent-bit/flb_input_chunk.h>
+#include <fluent-bit/flb_task.h>
 #include <msgpack.h>
 
 #include <ctype.h>
@@ -35,6 +38,11 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <errno.h>
+
+#ifndef FLB_SYSTEM_WINDOWS
+#include <unistd.h>
+#endif
 
 #ifdef FLB_SYSTEM_WINDOWS
 #include <Shlobj.h>
@@ -83,6 +91,7 @@ struct flb_file_conf {
     size_t rotate_max_size;
     int rotate_max_files;
     int rotate_gzip;
+    int atomic_chunks;
     struct file_rotate_ctx *rotation;
     int max_dynamic_files;
     int missing_field_action;
@@ -702,10 +711,29 @@ static int cb_file_init(struct flb_output_instance *ins,
         ctx->label_delimiter = ret_str;
     }
 
+    if (ctx->atomic_chunks == FLB_TRUE &&
+        (ctx->out_path == NULL || ctx->out_file != NULL ||
+         ctx->dynamic_destination == FLB_TRUE ||
+         ctx->format != FLB_OUT_FILE_FMT_PLAIN)) {
+        flb_plg_error(ctx->ins, "atomic_chunks requires a static path, Tag filenames and plain format");
+        file_conf_destroy(ctx);
+        return -1;
+    }
+#ifdef FLB_SYSTEM_WINDOWS
+    if (ctx->atomic_chunks == FLB_TRUE) {
+        flb_plg_error(ctx->ins, "atomic_chunks is not yet supported on Windows");
+        file_conf_destroy(ctx);
+        return -1;
+    }
+#endif
+
     /* Set the context */
     flb_output_set_context(ins, ctx);
 
-    ctx->rotation = file_rotate_create(ins, ctx->rotate, ctx->rotate_max_size,
+    /* Atomic files belong to the consumer; size rotation must not prune them. */
+    ctx->rotation = file_rotate_create(ins,
+                                       ctx->atomic_chunks == FLB_TRUE ? FLB_FALSE : ctx->rotate,
+                                       ctx->rotate_max_size,
                                        ctx->rotate_max_files,
                                        ctx->rotate_gzip);
     if (ctx->rotation == NULL) {
@@ -1127,6 +1155,212 @@ static int write_log_record(FILE *fp,
     return FLB_OK;
 }
 
+#ifndef FLB_SYSTEM_WINDOWS
+/* Compare a retry with a previously published chunk without trusting only its name. */
+static int atomic_files_equal(const char *left, const char *right)
+{
+    FILE *a;
+    FILE *b;
+    unsigned char left_bytes[8192];
+    unsigned char right_bytes[8192];
+    size_t left_len;
+    size_t right_len;
+    int result = 1;
+
+    a = fopen(left, "rb");
+    if (a == NULL) {
+        return -1;
+    }
+    b = fopen(right, "rb");
+    if (b == NULL) {
+        fclose(a);
+        return -1;
+    }
+    do {
+        left_len = fread(left_bytes, 1, sizeof(left_bytes), a);
+        right_len = fread(right_bytes, 1, sizeof(right_bytes), b);
+        if (left_len != right_len || memcmp(left_bytes, right_bytes, left_len) != 0) {
+            result = 0;
+            break;
+        }
+    } while (left_len == sizeof(left_bytes));
+    if (ferror(a) || ferror(b)) {
+        result = -1;
+    }
+    fclose(a);
+    fclose(b);
+    return result;
+}
+
+/* A completed file is visible to the consumer only after all bytes and its name are durable. */
+static int atomic_sync_directory(const char *path)
+{
+    int fd;
+    int ret;
+
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return -1;
+    }
+    ret = fsync(fd);
+    if (close(fd) != 0) {
+        ret = -1;
+    }
+    return ret;
+}
+
+/* Flush one Fluent Bit chunk to its own immutable NDJSON file. */
+static int flush_atomic_chunk(struct flb_event_chunk *event_chunk,
+                              struct flb_output_flush *out_flush,
+                              struct flb_file_conf *ctx,
+                              struct flb_config *config)
+{
+    struct flb_input_chunk *input_chunk;
+    struct flb_log_event_decoder decoder;
+    struct flb_log_event event;
+    const char *chunk_name;
+    unsigned char digest[32];
+    char id[sizeof(digest) * 2 + 1];
+    char tag[PATH_MAX];
+    char complete[PATH_MAX * 2];
+    char temporary[PATH_MAX * 2];
+    static const char hex[] = "0123456789abcdef";
+    FILE *fp = NULL;
+    int fd = -1;
+    int ret;
+    int created = 0;
+    int decoder_ready = 0;
+    int result = FLB_RETRY;
+    size_t records = 0;
+    size_t index;
+
+    if (event_chunk->type != FLB_INPUT_LOGS) {
+        flb_plg_error(ctx->ins, "atomic_chunks only supports log events");
+        return FLB_ERROR;
+    }
+    if (event_chunk->size == 0) {
+        return FLB_OK;
+    }
+    if (out_flush == NULL || out_flush->task == NULL || out_flush->task->ic == NULL) {
+        flb_plg_error(ctx->ins, "atomic_chunks requires a source input chunk");
+        return FLB_RETRY;
+    }
+    input_chunk = out_flush->task->ic;
+    /* ChunkIO stores a plain C string here, not an flb_sds_t allocation. */
+    chunk_name = flb_input_chunk_get_name(input_chunk);
+    if (chunk_name == NULL ||
+        flb_hash_simple(FLB_HASH_SHA256, (unsigned char *) chunk_name,
+                        strlen(chunk_name), digest, sizeof(digest)) != 0 ||
+        sanitize_tag_name(event_chunk->tag, tag, sizeof(tag)) != 0 ||
+        strchr(tag, FLB_PATH_SEPARATOR[0]) != NULL) {
+        flb_plg_error(ctx->ins, "cannot derive a safe atomic chunk filename");
+        return FLB_RETRY;
+    }
+    for (index = 0; index < sizeof(digest); index++) {
+        id[index * 2] = hex[digest[index] >> 4];
+        id[index * 2 + 1] = hex[digest[index] & 0x0f];
+    }
+    id[sizeof(id) - 1] = '\0';
+    ret = snprintf(complete, sizeof(complete), "%s/%s.%s.ready", ctx->out_path, tag, id);
+    if (ret < 0 || (size_t) ret >= sizeof(complete)) {
+        flb_plg_error(ctx->ins, "atomic chunk filename is too long");
+        return FLB_RETRY;
+    }
+    ret = snprintf(temporary, sizeof(temporary), "%s/.%s.%s.tmp.XXXXXX",
+                   ctx->out_path, tag, id);
+    if (ret < 0 || (size_t) ret >= sizeof(temporary)) {
+        flb_plg_error(ctx->ins, "atomic temporary filename is too long");
+        return FLB_RETRY;
+    }
+    fd = mkstemp(temporary);
+    if (fd < 0 && errno == ENOENT && ctx->mkdir == FLB_TRUE &&
+        mkpath(ctx->ins, ctx->out_path) == 0) {
+        fd = mkstemp(temporary);
+    }
+    if (fd < 0) {
+        flb_errno();
+        return FLB_RETRY;
+    }
+    created = 1;
+    /* mkstemp uses 0600; the writer container needs to read the published file. */
+    if (fchmod(fd, 0644) != 0) {
+        flb_errno();
+        goto done;
+    }
+    fp = fdopen(fd, "wb");
+    if (fp == NULL) {
+        flb_errno();
+        goto done;
+    }
+    fd = -1;
+    ret = flb_log_event_decoder_init(&decoder, event_chunk->data, event_chunk->size);
+    if (ret != FLB_EVENT_DECODER_SUCCESS) {
+        flb_plg_error(ctx->ins, "cannot decode atomic chunk: %d", ret);
+        goto done;
+    }
+    decoder_ready = 1;
+    while ((ret = flb_log_event_decoder_next(&decoder, &event)) == FLB_EVENT_DECODER_SUCCESS) {
+        char *json;
+
+        json = flb_msgpack_to_json_str(128, event.body, config->json_escape_unicode);
+        if (json == NULL) {
+            goto done;
+        }
+        if (fprintf(fp, "%s" NEWLINE, json) < 0) {
+            flb_free(json);
+            goto done;
+        }
+        flb_free(json);
+        records++;
+    }
+    /* Metadata-only chunks have no NDJSON rows for the consumer. */
+    if (ret == FLB_EVENT_DECODER_ERROR_INSUFFICIENT_DATA && records == 0) {
+        result = FLB_OK;
+        goto done;
+    }
+    if (ret != FLB_EVENT_DECODER_ERROR_INSUFFICIENT_DATA || ferror(fp) ||
+        fflush(fp) != 0 || fsync(fileno(fp)) != 0) {
+        flb_plg_error(ctx->ins, "cannot persist atomic chunk");
+        goto done;
+    }
+    if (fclose(fp) != 0) {
+        fp = NULL;
+        flb_errno();
+        goto done;
+    }
+    fp = NULL;
+
+    /* link() never replaces an existing file, even when two retries race. */
+    if (link(temporary, complete) != 0) {
+        if (errno != EEXIST || atomic_files_equal(temporary, complete) != 1) {
+            flb_plg_error(ctx->ins, "atomic chunk destination conflicts with %s", complete);
+            goto done;
+        }
+    }
+    if (unlink(temporary) != 0 || atomic_sync_directory(ctx->out_path) != 0) {
+        flb_plg_error(ctx->ins, "cannot sync atomic chunk directory %s", ctx->out_path);
+        goto done;
+    }
+    created = 0;
+    result = FLB_OK;
+
+done:
+    if (decoder_ready) {
+        flb_log_event_decoder_destroy(&decoder);
+    }
+    if (fp != NULL) {
+        fclose(fp);
+    }
+    else if (fd >= 0) {
+        close(fd);
+    }
+    if (created) {
+        unlink(temporary);
+    }
+    return result;
+}
+#endif
+
 static int flush_dynamic_logs(struct flb_event_chunk *event_chunk,
                               struct flb_file_conf *ctx,
                               struct flb_config *config,
@@ -1235,6 +1469,15 @@ static void cb_file_flush(struct flb_event_chunk *event_chunk,
     struct file_rotate_entry *rot_entry = NULL;
 
     (void) config;
+
+    if (ctx->atomic_chunks == FLB_TRUE) {
+#ifdef FLB_SYSTEM_WINDOWS
+        FLB_OUTPUT_RETURN(FLB_ERROR);
+#else
+        ret = flush_atomic_chunk(event_chunk, out_flush, ctx, config);
+        FLB_OUTPUT_RETURN(ret);
+#endif
+    }
 
     if (ctx->dynamic_destination == FLB_TRUE &&
         event_chunk->type != FLB_INPUT_METRICS) {
@@ -1552,6 +1795,14 @@ static struct flb_config_map config_map[] = {
      FLB_CONFIG_MAP_BOOL, "rotate_gzip", "true",
      0, FLB_TRUE, offsetof(struct flb_file_conf, rotate_gzip),
      "Compress rotated files with gzip"
+    },
+
+    {
+     FLB_CONFIG_MAP_BOOL, "atomic_chunks", "false",
+     0, FLB_TRUE, offsetof(struct flb_file_conf, atomic_chunks),
+     "Publish each log chunk as an immutable file after syncing its contents; "
+     "requires plain format and a static path (Unix only); "
+     "use filesystem input storage for restart recovery"
     },
 
     /* EOF */
