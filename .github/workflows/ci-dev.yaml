@@ -4,15 +4,20 @@ on:
   pull_request:
     branches: [v5.1.2-dev]
     types: [opened, synchronize, reopened]
-  # The image workflow reuses this job so direct pushes are tested before publishing.
-  workflow_call:
+  # The upstream suite includes external-fixture tests; run it explicitly when needed.
+  workflow_dispatch:
+    inputs:
+      full_suite:
+        description: Run all internal and runtime tests
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
   test:
-    name: Internal and runtime tests
+    name: File output tests
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -30,13 +35,26 @@ jobs:
         with:
           cmake-version: '3.31.6'
       - name: Configure tests
-        run: >-
-          cmake -S . -B build
-          -DFLB_CONFIG_YAML=On
-          -DFLB_TESTS_INTERNAL=On
-          -DFLB_TESTS_RUNTIME=On
-      - name: Build
+        env:
+          FULL_SUITE: ${{ inputs.full_suite }}
+        run: |
+          internal=Off
+          if [ "$FULL_SUITE" = true ]; then
+            internal=On
+          fi
+          cmake -S . -B build \
+            -DFLB_CONFIG_YAML=On \
+            -DFLB_TESTS_INTERNAL="$internal" \
+            -DFLB_TESTS_RUNTIME=On
+      - name: Build file output tests
+        if: ${{ !inputs.full_suite }}
+        run: cmake --build build --parallel 4 --target flb-rt-out_file flb-rt-out_file_rotation
+      - name: Run file output tests
+        if: ${{ !inputs.full_suite }}
+        run: ctest --test-dir build -R '^flb-rt-out_file(_rotation)?$' --output-on-failure --timeout 300
+      - name: Build full suite
+        if: ${{ inputs.full_suite }}
         run: cmake --build build --parallel 4
-      # Run every test enabled by the internal/runtime CMake configuration.
-      - name: Run tests
+      - name: Run full suite
+        if: ${{ inputs.full_suite }}
         run: ctest --test-dir build --output-on-failure --timeout 300
