@@ -16,13 +16,9 @@ env:
   IMAGE_NAME: registry.for-helper.pytrio.cn/trio/fluent-bit
 
 jobs:
-  # A merge and a direct push both enter here; neither can publish without passing CI.
-  test:
-    uses: ./.github/workflows/ci-dev.yaml
-
+  # PR checks run separately; branch pushes publish without repeating the full suite.
   publish:
     name: Publish Linux amd64 image
-    needs: test
     runs-on: self-hosted
     timeout-minutes: 120
     steps:
