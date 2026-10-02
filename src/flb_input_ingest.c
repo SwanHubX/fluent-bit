@@ -20,6 +20,7 @@
 #include <errno.h>
 #include <time.h>
 #include <string.h>
+#include <stdint.h>
 
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_input.h>
@@ -46,6 +47,7 @@ struct flb_input_ingress_event {
     int type;
     flb_sds_t tag;
     size_t size;
+    size_t units;
 
     union {
         struct {
@@ -187,36 +189,60 @@ static int flb_input_ingress_busy(struct flb_input_instance *ins,
     return FLB_INPUT_INGRESS_BUSY;
 }
 
-static int flb_input_ingress_enqueue(struct flb_input_instance *ins,
-                                     struct flb_input_ingress_event *event)
+static int flb_input_ingress_enqueue_batch(struct flb_input_instance *ins,
+                                           struct mk_list *events,
+                                           size_t units, size_t event_size,
+                                           int oversized_status)
 {
-    size_t event_size;
+    struct mk_list *head;
+    struct mk_list *tmp;
+    struct flb_input_ingress_event *event;
+    int result = -1;
+    int busy_recorded = FLB_FALSE;
     int queue_is_full;
     int should_signal;
     int wait_result;
+    int wait_timeout_ms = 100;
     struct timespec deadline;
 
-    if (ins == NULL || event == NULL || ins->ingress_queue_enabled != FLB_TRUE) {
-        flb_input_ingress_event_destroy(event);
-        return -1;
+    if (ins == NULL || ins->ingress_queue_enabled != FLB_TRUE) {
+        goto rejected;
     }
-
-    event_size = flb_input_ingress_event_size(event);
     should_signal = FLB_FALSE;
 
     pthread_mutex_lock(&ins->ingress_queue_lock);
 
-    if (ins->ingress_queue_byte_limit > 0 &&
-        event_size > ins->ingress_queue_byte_limit) {
+    /* A request that cannot ever fit must be split, not retried unchanged. */
+    if ((ins->ingress_queue_event_limit > 0 && units > ins->ingress_queue_event_limit) ||
+        (ins->ingress_queue_byte_limit > 0 && event_size > ins->ingress_queue_byte_limit)) {
         pthread_mutex_unlock(&ins->ingress_queue_lock);
-        return flb_input_ingress_busy(ins, event);
+        result = oversized_status;
+        goto rejected;
+    }
+
+    if (ins->http_server_config != NULL &&
+        ins->http_server_config->ingress_queue_wait_timeout_ms >= 0) {
+        wait_timeout_ms = ins->http_server_config->ingress_queue_wait_timeout_ms;
+    }
+#if defined(FLB_SYSTEM_WINDOWS)
+    timespec_get(&deadline, TIME_UTC);
+#elif defined(CLOCK_MONOTONIC) && !defined(FLB_SYSTEM_MACOS)
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+#else
+    clock_gettime(CLOCK_REALTIME, &deadline);
+#endif
+    deadline.tv_sec += wait_timeout_ms / 1000;
+    deadline.tv_nsec += (wait_timeout_ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
     }
 
     while (ins->ingress_queue_enabled == FLB_TRUE) {
         queue_is_full = FLB_FALSE;
 
         if (ins->ingress_queue_event_limit > 0 &&
-            ins->ingress_queue_pending_events >= ins->ingress_queue_event_limit) {
+            ins->ingress_queue_pending_events > ins->ingress_queue_event_limit - units) {
             queue_is_full = FLB_TRUE;
         }
 
@@ -232,43 +258,35 @@ static int flb_input_ingress_enqueue(struct flb_input_instance *ins,
             break;
         }
 
-#if defined(FLB_SYSTEM_WINDOWS)
-        timespec_get(&deadline, TIME_UTC);
-#elif defined(CLOCK_MONOTONIC) && !defined(FLB_SYSTEM_MACOS)
-        clock_gettime(CLOCK_MONOTONIC, &deadline);
-#else
-        clock_gettime(CLOCK_REALTIME, &deadline);
-#endif
-        deadline.tv_nsec += 100 * 1000 * 1000;
-        if (deadline.tv_nsec >= 1000000000) {
-            deadline.tv_sec++;
-            deadline.tv_nsec -= 1000000000;
-        }
-
+        /* One deadline for the request, including spurious wakes. */
         wait_result = pthread_cond_timedwait(&ins->ingress_queue_space_available,
                                              &ins->ingress_queue_lock,
                                              &deadline);
         if (wait_result == ETIMEDOUT) {
             pthread_mutex_unlock(&ins->ingress_queue_lock);
-            return flb_input_ingress_busy(ins, event);
+            result = FLB_INPUT_INGRESS_BUSY;
+            goto rejected;
         }
         else if (wait_result != 0) {
             pthread_mutex_unlock(&ins->ingress_queue_lock);
-            flb_input_ingress_event_destroy(event);
-            return -1;
+            goto rejected;
         }
     }
 
     if (ins->ingress_queue_enabled != FLB_TRUE) {
         pthread_mutex_unlock(&ins->ingress_queue_lock);
 
-        flb_input_ingress_event_destroy(event);
-
-        return FLB_INPUT_INGRESS_BUSY;
+        result = FLB_INPUT_INGRESS_BUSY;
+        goto rejected;
     }
 
-    mk_list_add(&event->_head, &ins->ingress_queue);
-    ins->ingress_queue_pending_events++;
+    /* The owner cannot drain a prefix while a multi-Tag request is committed. */
+    mk_list_foreach_safe(head, tmp, events) {
+        event = mk_list_entry(head, struct flb_input_ingress_event, _head);
+        mk_list_del(head);
+        mk_list_add(head, &ins->ingress_queue);
+    }
+    ins->ingress_queue_pending_events += units;
     ins->ingress_queue_pending_bytes += event_size;
     flb_input_ingress_update_metrics(ins);
 
@@ -284,6 +302,34 @@ static int flb_input_ingress_enqueue(struct flb_input_instance *ins,
     }
 
     return 0;
+
+rejected:
+    mk_list_foreach_safe(head, tmp, events) {
+        event = mk_list_entry(head, struct flb_input_ingress_event, _head);
+        if (result == FLB_INPUT_INGRESS_BUSY && busy_recorded == FLB_FALSE) {
+            flb_input_ingress_busy(ins, event);
+            busy_recorded = FLB_TRUE;
+        }
+        else {
+            flb_input_ingress_event_destroy(event);
+        }
+    }
+    return result;
+}
+
+static int flb_input_ingress_enqueue(struct flb_input_instance *ins,
+                                     struct flb_input_ingress_event *event)
+{
+    struct mk_list events;
+
+    if (event == NULL) {
+        return -1;
+    }
+    mk_list_init(&events);
+    mk_list_add(&event->_head, &events);
+    return flb_input_ingress_enqueue_batch(ins, &events, event->units,
+                                           flb_input_ingress_event_size(event),
+                                           FLB_INPUT_INGRESS_BUSY);
 }
 
 static struct flb_input_ingress_event *flb_input_ingress_event_create(
@@ -300,6 +346,7 @@ static struct flb_input_ingress_event *flb_input_ingress_event_create(
     }
 
     event->type = type;
+    event->units = 1;
     cfl_list_init(&event->metrics);
     mk_list_entry_init(&event->_head);
 
@@ -553,6 +600,57 @@ int flb_input_ingress_queue_log(struct flb_input_instance *ins,
     event->size = buf_size;
 
     return flb_input_ingress_enqueue(ins, event);
+}
+
+int flb_input_ingress_queue_log_batch(struct flb_input_instance *ins,
+                                      const struct flb_input_ingress_log *logs,
+                                      size_t count)
+{
+    struct mk_list events;
+    struct mk_list *head;
+    struct mk_list *tmp;
+    struct flb_input_ingress_event *event;
+    size_t units = 0;
+    size_t bytes = 0;
+    size_t index;
+
+    if (ins == NULL || logs == NULL || count == 0) {
+        return -1;
+    }
+    mk_list_init(&events);
+    for (index = 0; index < count; index++) {
+        if (logs[index].records == 0 || logs[index].buf == NULL || logs[index].buf_size == 0 ||
+            logs[index].records > SIZE_MAX - units || logs[index].buf_size > SIZE_MAX - bytes) {
+            goto failed;
+        }
+        event = flb_input_ingress_event_create(FLB_INPUT_INGRESS_LOG,
+                                               logs[index].tag, logs[index].tag_len);
+        if (event == NULL) {
+            goto failed;
+        }
+        mk_list_add(&event->_head, &events);
+        event->data.log.buf = flb_malloc(logs[index].buf_size);
+        if (event->data.log.buf == NULL) {
+            flb_errno();
+            goto failed;
+        }
+        memcpy(event->data.log.buf, logs[index].buf, logs[index].buf_size);
+        event->data.log.size = logs[index].buf_size;
+        event->data.log.records = logs[index].records;
+        event->size = logs[index].buf_size;
+        event->units = logs[index].records;
+        units += event->units;
+        bytes += event->size;
+    }
+    return flb_input_ingress_enqueue_batch(ins, &events, units, bytes,
+                                           FLB_INPUT_INGRESS_TOO_LARGE);
+
+failed:
+    mk_list_foreach_safe(head, tmp, &events) {
+        event = mk_list_entry(head, struct flb_input_ingress_event, _head);
+        flb_input_ingress_event_destroy(event);
+    }
+    return -1;
 }
 
 int flb_input_ingress_queue_log_take(struct flb_input_instance *ins,
