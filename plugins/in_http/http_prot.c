@@ -324,14 +324,15 @@ static int append_remote_addr(
     return 0;
 }
 
-static int process_pack_record(struct flb_http *ctx,
-                               struct flb_log_event_encoder *encoder,
-                               struct flb_time *tm,
-                               flb_sds_t tag,
-                               msgpack_object *record)
+static int encode_pack_record(struct flb_log_event_encoder *encoder,
+                                struct flb_time *tm,
+                                msgpack_object *record)
 {
     int ret;
 
+    if (record->type != MSGPACK_OBJECT_MAP) {
+        return -1;
+    }
     ret = flb_log_event_encoder_begin_record(encoder);
     if (ret != FLB_EVENT_ENCODER_SUCCESS) {
         return -1;
@@ -355,28 +356,120 @@ static int process_pack_record(struct flb_http *ctx,
         return -1;
     }
 
-    if (tag) {
-        ret = http_ingest_logs(ctx,
-                               tag,
-                               flb_sds_len(tag),
-                               encoder->output_buffer,
-                               encoder->output_length);
-    }
-    else {
-        /* use default plugin Tag (it internal name, e.g: http.0 */
-        ret = http_ingest_logs(ctx, NULL, 0,
-                               encoder->output_buffer,
-                               encoder->output_length);
-    }
+    return ret;
+}
 
-    if (ret == FLB_INPUT_INGRESS_BUSY) {
-        return FLB_INPUT_INGRESS_BUSY;
-    }
+struct http_log_batch {
+    struct flb_input_ingress_log *logs;
+    size_t count;
+    size_t capacity;
+    flb_sds_t tag;
+    size_t records;
+};
 
-    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+static void http_batch_destroy(struct http_log_batch *batch)
+{
+    size_t index;
+
+    for (index = 0; index < batch->count; index++) {
+        flb_sds_destroy((flb_sds_t) batch->logs[index].tag);
+        flb_free((void *) batch->logs[index].buf);
+    }
+    flb_sds_destroy(batch->tag);
+    flb_free(batch->logs);
+}
+
+static int http_batch_flush(struct http_log_batch *batch,
+                             struct flb_log_event_encoder *encoder)
+{
+    struct flb_input_ingress_log *logs;
+    struct flb_input_ingress_log *entry;
+    size_t capacity;
+    void *buffer;
+
+    if (batch->records == 0) {
+        return 0;
+    }
+    if (batch->count == batch->capacity) {
+        capacity = batch->capacity == 0 ? 8 : batch->capacity * 2;
+        logs = flb_realloc(batch->logs, capacity * sizeof(*logs));
+        if (logs == NULL) {
+            flb_errno();
+            return -1;
+        }
+        batch->logs = logs;
+        batch->capacity = capacity;
+    }
+    /* Keep only used bytes; alternating Tags must not retain an 8KB buffer per row. */
+    buffer = flb_malloc(encoder->output_length);
+    if (buffer == NULL) {
+        flb_errno();
         return -1;
     }
+    memcpy(buffer, encoder->output_buffer, encoder->output_length);
+    entry = &batch->logs[batch->count++];
+    entry->tag = batch->tag;
+    entry->tag_len = batch->tag == NULL ? 0 : flb_sds_len(batch->tag);
+    entry->buf = buffer;
+    entry->buf_size = encoder->output_length;
+    entry->records = batch->records;
+    batch->tag = NULL;
+    batch->records = 0;
+    flb_log_event_encoder_reset(encoder);
+    return 0;
+}
 
+static int http_batch_record(struct http_log_batch *batch,
+                              struct flb_log_event_encoder *encoder,
+                              struct flb_time *tm, flb_sds_t tag,
+                              msgpack_object *record)
+{
+    int ret;
+    int same_tag;
+
+    same_tag = (batch->tag == NULL && tag == NULL) ||
+               (batch->tag != NULL && tag != NULL && strcmp(batch->tag, tag) == 0);
+    if (batch->records > 0 && !same_tag) {
+        if (http_batch_flush(batch, encoder) != 0) {
+            return -1;
+        }
+    }
+    if (batch->records == 0 && tag != NULL) {
+        batch->tag = flb_sds_create(tag);
+        if (batch->tag == NULL) {
+            return -1;
+        }
+    }
+    ret = encode_pack_record(encoder, tm, record);
+    if (ret == 0) {
+        batch->records++;
+    }
+    return ret;
+}
+
+static int http_batch_commit(struct flb_http *ctx, struct http_log_batch *batch,
+                              struct flb_log_event_encoder *encoder)
+{
+    size_t index;
+    int ret;
+    const struct flb_input_ingress_log *entry;
+
+    ret = http_batch_flush(batch, encoder);
+    if (ret != 0 || batch->count == 0) {
+        return ret;
+    }
+    if (http_uses_worker_ingress_queue(ctx)) {
+        /* Reserve both record and byte capacity before publishing any Tag. */
+        return flb_input_ingress_queue_log_batch(ctx->ins, batch->logs, batch->count);
+    }
+    for (index = 0; index < batch->count; index++) {
+        entry = &batch->logs[index];
+        ret = flb_input_log_append_records(ctx->ins, entry->records, entry->tag,
+                                            entry->tag_len, entry->buf, entry->buf_size);
+        if (ret != 0) {
+            return ret;
+        }
+    }
     return 0;
 }
 
@@ -596,6 +689,7 @@ static int process_pack_ng(struct flb_http *ctx, flb_sds_t tag, char *buf,
                            struct flb_log_event_encoder *encoder)
 {
     int ret;
+    struct http_log_batch batch = {0};
     size_t off = 0;
     msgpack_unpacked result;
     struct flb_time tm;
@@ -643,26 +737,20 @@ static int process_pack_ng(struct flb_http *ctx, flb_sds_t tag, char *buf,
             }
 
             if (tag_from_record) {
-                ret = process_pack_record(ctx, encoder, &tm, tag_from_record, obj);
+                ret = http_batch_record(&batch, encoder, &tm, tag_from_record, obj);
                 flb_sds_destroy(tag_from_record);
             }
             else if (tag) {
-                ret = process_pack_record(ctx, encoder, &tm, tag, obj);
+                ret = http_batch_record(&batch, encoder, &tm, tag, obj);
             }
             else {
-                ret = process_pack_record(ctx, encoder, &tm, NULL, obj);
-            }
-
-            if (ret == FLB_INPUT_INGRESS_BUSY) {
-                flb_log_event_encoder_reset(encoder);
-                goto ingress_busy;
+                ret = http_batch_record(&batch, encoder, &tm, NULL, obj);
             }
 
             if (ret != 0) {
                 goto log_event_error;
             }
 
-            flb_log_event_encoder_reset(encoder);
         }
         else if (result.data.type == MSGPACK_OBJECT_ARRAY) {
             obj = &result.data;
@@ -693,33 +781,20 @@ static int process_pack_ng(struct flb_http *ctx, flb_sds_t tag, char *buf,
                 }
 
                 if (tag_from_record) {
-                    ret = process_pack_record(ctx, encoder, &tm, tag_from_record, &record);
+                    ret = http_batch_record(&batch, encoder, &tm, tag_from_record, &record);
                     flb_sds_destroy(tag_from_record);
                 }
                 else if (tag) {
-                    ret = process_pack_record(ctx, encoder, &tm, tag, &record);
+                    ret = http_batch_record(&batch, encoder, &tm, tag, &record);
                 }
                 else {
-                    ret = process_pack_record(ctx, encoder, &tm, NULL, &record);
-                }
-
-                if (ret == FLB_INPUT_INGRESS_BUSY) {
-                    flb_log_event_encoder_reset(encoder);
-                    goto ingress_busy;
+                    ret = http_batch_record(&batch, encoder, &tm, NULL, &record);
                 }
 
                 if (ret != 0) {
                     goto log_event_error;
                 }
 
-                /* TODO : Optimize this
-                 *
-                 * This is wasteful, considering that we are emitting a series
-                 * of records we should start and commit each one and then
-                 * emit them all at once after the loop.
-                 */
-
-                flb_log_event_encoder_reset(encoder);
             }
 
             break;
@@ -728,40 +803,20 @@ static int process_pack_ng(struct flb_http *ctx, flb_sds_t tag, char *buf,
             flb_plg_error(ctx->ins, "skip record from invalid type: %i",
                          result.data.type);
 
-            msgpack_unpacked_destroy(&result);
-            if (remote_addr != NULL) {
-                flb_sds_destroy(remote_addr);
-            }
-
-            return -1;
+            ret = -1;
+            goto log_event_error;
         }
     }
 
-    msgpack_unpacked_destroy(&result);
-    if (appended_initialized) {
-        msgpack_unpacked_destroy(&appended_result);
-        msgpack_sbuffer_destroy(&appended_sbuf);
-    }
-    if (remote_addr != NULL) {
-        flb_sds_destroy(remote_addr);
-    }
-
-    return 0;
-
-ingress_busy:
-    msgpack_unpacked_destroy(&result);
-    if (appended_initialized) {
-        msgpack_unpacked_destroy(&appended_result);
-        msgpack_sbuffer_destroy(&appended_sbuf);
-    }
-    if (remote_addr != NULL) {
-        flb_sds_destroy(remote_addr);
-    }
-
-    return FLB_INPUT_INGRESS_BUSY;
+    ret = http_batch_commit(ctx, &batch, encoder);
+    goto done;
 
 log_event_error:
     flb_plg_error(ctx->ins, "Error encoding record : %d", ret);
+    ret = -1;
+
+done:
+    http_batch_destroy(&batch);
     msgpack_unpacked_destroy(&result);
     if (appended_initialized) {
         msgpack_unpacked_destroy(&appended_result);
@@ -770,8 +825,7 @@ log_event_error:
     if (remote_addr != NULL) {
         flb_sds_destroy(remote_addr);
     }
-
-    return -1;
+    return ret;
 }
 
 static ssize_t parse_payload_json_ng(flb_sds_t tag,
@@ -980,6 +1034,9 @@ int http_prot_handle_ng(struct flb_http_request *request,
     }
     else if (ret == FLB_INPUT_INGRESS_BUSY) {
         send_response_ng(response, 503, "error: deferred ingress queue is full\n");
+    }
+    else if (ret == FLB_INPUT_INGRESS_TOO_LARGE) {
+        send_response_ng(response, 413, "error: batch exceeds ingress queue capacity\n");
     }
     else {
         send_response_ng(response, 400, "error: unable to process records\n");
