@@ -81,6 +81,7 @@
 
 /* Owner-side ingress queue status */
 #define FLB_INPUT_INGRESS_BUSY -2
+#define FLB_INPUT_INGRESS_TOO_LARGE -3
 
 /* 1 second in nsec unit */
 #define FLB_NSEC_IN_SEC 1000000000ULL
@@ -945,6 +946,19 @@ int flb_input_ingress_enable(struct flb_input_instance *ins);
 int flb_input_ingress_queue_log(struct flb_input_instance *ins,
                                 const char *tag, size_t tag_len,
                                 const void *buf, size_t buf_size);
+/* Borrowed, encoded log groups; admission charges each group's record count. */
+struct flb_input_ingress_log {
+    const char *tag;
+    size_t tag_len;
+    const void *buf;
+    size_t buf_size;
+    size_t records;
+};
+
+/* Copy and admit every group together, or accept none of them. */
+int flb_input_ingress_queue_log_batch(struct flb_input_instance *ins,
+                                      const struct flb_input_ingress_log *logs,
+                                      size_t count);
 /* The take and decoded-signal queue functions always consume their payload. */
 int flb_input_ingress_queue_log_take(struct flb_input_instance *ins,
                                      const char *tag, size_t tag_len,

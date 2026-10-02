@@ -838,6 +838,7 @@ void flb_http_server_config_init(struct flb_http_server_config *config)
     config->workers = 1;
     config->ingress_queue_event_limit = FLB_HTTP_SERVER_INGRESS_QUEUE_EVENT_LIMIT;
     config->ingress_queue_byte_limit = FLB_HTTP_SERVER_INGRESS_QUEUE_BYTE_LIMIT;
+    config->ingress_queue_wait_timeout_ms = 100;
 }
 
 int flb_http_server_options_init_from_input(struct flb_http_server_options *options,

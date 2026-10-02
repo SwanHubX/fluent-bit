@@ -1,6 +1,8 @@
 /* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
 
 #include <fluent-bit/flb_config.h>
+#include <fluent-bit/flb_lib.h>
+#include <fluent-bit/flb_input.h>
 #include <fluent-bit/flb_http_common.h>
 #include <fluent-bit/flb_io.h>
 #include <fluent-bit/flb_network.h>
@@ -715,7 +717,74 @@ void test_http_server_session_destroy_is_reentrant_safe()
     flb_free(session);
 }
 
+/* 队列暂满时整个多 Tag 批次不得留下前缀，永久超限与临时背压必须区分。 */
+static void test_batch_queue(void)
+{
+    const char records[] = "\x92\x01\x80\x92\x01\x80\x92\x01\x80\x92\x01\x80";
+    const char large[] = "\x92\x01\x81\xa1" "x" "\xb4" "abcdefghijklmnopqrst";
+    struct flb_input_ingress_log first = {"a", 1, records, 6, 2};
+    struct flb_input_ingress_log second[] = {
+        {"b", 1, records, 3, 1}, {"c", 1, records + 3, 3, 1}
+    };
+    struct flb_input_ingress_log oversized = {"d", 1, records, 12, 4};
+    struct flb_input_ingress_log bytes = {"e", 1, large, sizeof(large) - 1, 1};
+    struct flb_input_instance *ins;
+    flb_ctx_t *ctx;
+    int id;
+
+    ctx = flb_create();
+    if (!TEST_CHECK(ctx != NULL)) {
+        return;
+    }
+    ctx->config->evl = mk_event_loop_create(32);
+    if (!TEST_CHECK(ctx->config->evl != NULL)) {
+        flb_destroy(ctx);
+        return;
+    }
+    id = flb_input(ctx, "dummy", NULL);
+    ins = flb_input_get_instance(ctx->config, id);
+    if (!TEST_CHECK(ins != NULL)) {
+        flb_destroy(ctx);
+        return;
+    }
+    if (!TEST_CHECK(flb_input_ingress_enable(ins) == 0)) {
+        flb_destroy(ctx);
+        return;
+    }
+    /* 不启动 owner，使两个已接收记录稳定占用配额，避免依赖线程调度复现。 */
+    ins->ingress_queue_event_limit = 3;
+    ins->ingress_queue_byte_limit = 16;
+    if (ins->http_server_config == NULL) {
+        ins->http_server_config = flb_calloc(1, sizeof(*ins->http_server_config));
+    }
+    if (!TEST_CHECK(ins->http_server_config != NULL)) {
+        flb_destroy(ctx);
+        return;
+    }
+    ins->http_server_config->ingress_queue_wait_timeout_ms = 250;
+    TEST_CHECK(flb_input_ingress_queue_log_batch(ins, &first, 1) == 0);
+    TEST_CHECK(ins->ingress_queue_pending_events == 2);
+    TEST_CHECK(ins->ingress_queue_pending_bytes == 6);
+    {
+        uint64_t started = cfl_time_now();
+
+        TEST_CHECK(flb_input_ingress_queue_log_batch(ins, second, 2) == FLB_INPUT_INGRESS_BUSY);
+        /* 配置的等待窗口必须生效，不能仍按原来的 100ms 提前拒绝。 */
+        TEST_CHECK(cfl_time_now() - started >= 200000000);
+    }
+    TEST_CHECK(ins->ingress_queue_pending_events == 2);
+    TEST_CHECK(ins->ingress_queue_pending_bytes == 6);
+    TEST_CHECK(mk_list_size(&ins->ingress_queue) == 1);
+    TEST_CHECK(flb_input_ingress_queue_log_batch(ins, &oversized, 1) ==
+               FLB_INPUT_INGRESS_TOO_LARGE);
+    TEST_CHECK(flb_input_ingress_queue_log_batch(ins, &bytes, 1) == FLB_INPUT_INGRESS_TOO_LARGE);
+    TEST_CHECK(ins->ingress_queue_pending_events == 2);
+    TEST_CHECK(ins->ingress_queue_pending_bytes == 6);
+    flb_destroy(ctx);
+}
+
 TEST_LIST = {
+    { "batch_queue", test_batch_queue },
     { "http_server_options_defaults", test_http_server_options_defaults },
     { "http_server_options_multi_worker_magic", test_http_server_options_multi_worker_magic },
     { "http_server_managed_worker_contract", test_http_server_managed_worker_contract },

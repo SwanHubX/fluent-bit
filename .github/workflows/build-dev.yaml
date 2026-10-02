@@ -19,7 +19,7 @@ jobs:
   # PR checks run separately; branch pushes publish without repeating the full suite.
   publish:
     name: Publish Linux amd64 image
-    runs-on: self-hosted
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
