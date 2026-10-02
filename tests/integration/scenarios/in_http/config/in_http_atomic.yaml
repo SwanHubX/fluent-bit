@@ -1,0 +1,23 @@
+service:
+  flush: 1
+  log_level: info
+  http_server: on
+  http_port: ${FLUENT_BIT_HTTP_MONITORING_PORT}
+
+pipeline:
+  inputs:
+    - name: http
+      port: ${FLUENT_BIT_TEST_LISTENER_PORT}
+      enable_health_endpoint: on
+      http2: off
+      workers: ${ATOMIC_WORKERS}
+      threaded: true
+      tag_key: route
+      http_server.ingress_queue_event_limit: ${ATOMIC_EVENTS}
+      http_server.ingress_queue_byte_limit: ${ATOMIC_BYTES}
+  outputs:
+    - name: file
+      match: '*'
+      path: ${ATOMIC_OUT}
+      format: plain
+      mkdir: on
