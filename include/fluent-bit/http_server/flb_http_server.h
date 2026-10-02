@@ -78,6 +78,7 @@ struct flb_http_server_config {
     int    workers;
     size_t ingress_queue_event_limit;
     size_t ingress_queue_byte_limit;
+    int    ingress_queue_wait_timeout_ms;
 };
 
 struct flb_http_server_options {
